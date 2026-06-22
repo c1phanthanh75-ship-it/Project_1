@@ -51,10 +51,15 @@
  *
  * Voi R_SHUNT=0.1 ohm va GAIN_ACTUAL=20:
  *   SENSOR_SENS_V = 0.1 * 20 = 2.0 V/A
- *   Neu I_motor=0.20A:
- *       V_sense = 0.20 * 2.0 = 0.40V
+ *   Neu muc tieu I_motor=20mA = 0.020A:
+ *       V_sense = 0.020 * 2.0 = 0.040V
+ *       ADC raw ~= 0.040 / 3.3 * 4096 = 50 counts
+ *   Vi tin hieu 20mA kha nho, can calibrate offset va nen loc nhieu mau.
  *   Dong lon nhat de V_sense < 3.3V:
  *       I_adc_safe = (3.3 - offset) / 2.0 ~= 1.65A
+ *
+ * PID chay theo don vi mA de tranh gain qua nho khi dieu khien vung 0.020A.
+ * Bao ve qua dong van dung don vi A vi adc_to_current() tra ve ampere.
  *
  * CURRENT_LIMIT_A la nguong bao ve theo dong motor 12V thuc te.
  * Hay chinh lai theo dong dinh muc/stall current cua motor va kha nang driver.
@@ -72,9 +77,14 @@
 #define OFFSET_MANUAL 0.0f
 #define CALIB_SAMPLES 200
 
-#define CURRENT_LIMIT_A 0.30f
-#define CURRENT_RESUME_A 0.10f
+#define PID_SETPOINT_MA 20.0f
+#define CURRENT_LIMIT_A 0.025f
+#define CURRENT_RESUME_A 0.010f
 #define FAULT_COOLDOWN_MS 2000UL
+
+#define PID_KP 3.0
+#define PID_KI 0.8
+#define PID_KD 0.02
 
 #define FILTER_N 16
 #define PID_SAMPLE_TIME_MS 5U
@@ -206,6 +216,11 @@ static float duty_to_motor_voltage(uint32_t duty)
     return ((float)duty / (float)PWM_DUTY_MAX) * MOTOR_SUPPLY_V;
 }
 
+static float amp_to_milliamp(float current_a)
+{
+    return current_a * 1000.0f;
+}
+
 static void calibrate_offset(void)
 {
 #if CALIB_ON_BOOT
@@ -240,6 +255,10 @@ static void calibrate_offset(void)
              R_SHUNT, GAIN_ACTUAL, SENSOR_SENS_V);
     ESP_LOGI(TAG, "[CALIB] Motor supply=%.1f V, ADC max=%.1f V",
              MOTOR_SUPPLY_V, ADC_VREF);
+    ESP_LOGI(TAG, "[CALIB] PID setpoint=%.1f mA, current limit=%.1f mA, resume=%.1f mA",
+             PID_SETPOINT_MA,
+             amp_to_milliamp(CURRENT_LIMIT_A),
+             amp_to_milliamp(CURRENT_RESUME_A));
     ESP_LOGI(TAG, "[CALIB] I_adc_safe (V_sense<%.1fV) = %.2f A",
              ADC_VREF, (ADC_VREF - sensor_offset_v) / SENSOR_SENS_V);
     ESP_LOGI(TAG, "[CALIB] Done");
@@ -254,8 +273,8 @@ static void print_status(float current, int adc_raw, uint32_t duty)
 
 #if SERIAL_MONITOR
     ESP_LOGI(TAG, "----------------------------------------");
-    ESP_LOGI(TAG, "  Setpoint : %.2f A", motor_pid.setpoint);
-    ESP_LOGI(TAG, "  Current  : %.2f A", current);
+    ESP_LOGI(TAG, "  Setpoint : %.1f mA", amp_to_milliamp((float)motor_pid.setpoint));
+    ESP_LOGI(TAG, "  Current  : %.1f mA", amp_to_milliamp(current));
     ESP_LOGI(TAG, "  V_sense  : %.3f V", current * SENSOR_SENS_V);
     ESP_LOGI(TAG, "  V_motor  : %.2f V avg est", motor_voltage);
     ESP_LOGI(TAG, "  ADC raw  : %d", adc_raw);
@@ -265,8 +284,9 @@ static void print_status(float current, int adc_raw, uint32_t duty)
 #endif
 
 #if SERIAL_PLOTTER
-    printf("%.2f\t%.2f\t%.1f\t%.2f\t%d\n",
-           motor_pid.setpoint, current, duty_pct, motor_voltage, fault_active ? 1 : 0);
+    printf("%.1f\t%.1f\t%.1f\t%.2f\t%d\n",
+           amp_to_milliamp((float)motor_pid.setpoint), amp_to_milliamp(current),
+           duty_pct, motor_voltage, fault_active ? 1 : 0);
 #endif
 }
 
@@ -283,12 +303,12 @@ void app_main(void)
 
     calibrate_offset();
 
-    pid_controller_init(&motor_pid, 80.0, 15.0, 0.2, 0.20, PID_SAMPLE_TIME_MS);
+    pid_controller_init(&motor_pid, PID_KP, PID_KI, PID_KD, PID_SETPOINT_MA, PID_SAMPLE_TIME_MS);
     pid_controller_set_output_limits(&motor_pid, 0.0, (double)PWM_DUTY_MAX);
     pid_controller_set_mode(&motor_pid, true, 0.0, millis_u32());
 
 #if SERIAL_PLOTTER
-    printf("Setpoint(A)\tMeasured(A)\tDuty%%\tMotorV(avg)\tFault\n");
+    printf("Setpoint(mA)\tMeasured(mA)\tDuty%%\tMotorV(avg)\tFault\n");
 #endif
 
     ESP_LOGI(TAG, "[INIT] Ready");
@@ -304,8 +324,8 @@ void app_main(void)
             fault_time_ms = millis_u32();
             pwm_write(0);
 #if SERIAL_MONITOR
-            ESP_LOGE(TAG, "[FAULT] Overcurrent! %.2f A >= %.1f A; PWM OFF",
-                     current, CURRENT_LIMIT_A);
+            ESP_LOGE(TAG, "[FAULT] Overcurrent! %.1f mA >= %.1f mA; PWM OFF",
+                     amp_to_milliamp(current), amp_to_milliamp(CURRENT_LIMIT_A));
 #endif
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
@@ -317,12 +337,12 @@ void app_main(void)
                 (current < CURRENT_RESUME_A)) {
                 fault_active = false;
 #if SERIAL_MONITOR
-                ESP_LOGI(TAG, "[RESUME] %.2f A; PID restarting", current);
+                ESP_LOGI(TAG, "[RESUME] %.1f mA; PID restarting", amp_to_milliamp(current));
 #endif
-                pid_controller_set_mode(&motor_pid, false, current, now_ms);
+                pid_controller_set_mode(&motor_pid, false, amp_to_milliamp(current), now_ms);
                 motor_pid.output = 0.0;
                 pwm_write(0);
-                pid_controller_set_mode(&motor_pid, true, current, now_ms);
+                pid_controller_set_mode(&motor_pid, true, amp_to_milliamp(current), now_ms);
             } else {
                 pwm_write(0);
                 vTaskDelay(pdMS_TO_TICKS(1));
@@ -330,7 +350,7 @@ void app_main(void)
             }
         }
 
-        pid_controller_compute(&motor_pid, (double)current, millis_u32());
+        pid_controller_compute(&motor_pid, (double)amp_to_milliamp(current), millis_u32());
 
         const uint32_t duty = (uint32_t)clamp_double(motor_pid.output, 0.0, (double)PWM_DUTY_MAX);
         pwm_write(duty);
